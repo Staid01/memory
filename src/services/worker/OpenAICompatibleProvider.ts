@@ -3,8 +3,8 @@ import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
-import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
-import type { ActiveSession, ConversationMessage } from '../worker-types.js';
+import { buildInitPrompt, buildObservationPromptParts, renderObservationPrompt, type ObservationPromptParts, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
+import type { ActiveSession, ConversationMessage, PendingMessageWithId } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import type { ModeConfig } from '../domain/types.js';
 import { resolveSummaryTierModel } from './model-aliases.js';
@@ -79,6 +79,11 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
 
   /** Issue the actual HTTP request and normalize its response. */
   protected abstract query(history: ConversationMessage[], config: TConfig, signal?: AbortSignal): Promise<ProviderQueryResult>;
+
+  /** Allow providers to apply initialization-only response handling. */
+  protected queryForInitialization(history: ConversationMessage[], config: TConfig): Promise<ProviderQueryResult> {
+    return this.query(history, config);
+  }
 
   /**
    * One bounded, standalone call that condenses an oversized tool payload.
@@ -175,7 +180,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     try {
       session.lastPromptSentAt = Date.now();
       session.lastGeneratorSource = 'init';
-      const initResponse = await this.query(session.conversationHistory, config);
+      const initResponse = await this.queryForInitialization(session.conversationHistory, config);
       this.handleInitResponse(initResponse, session, model);
     } catch (error: unknown) {
       // Classified errors are logged once, at SessionRoutes' `Observer failed`
@@ -259,9 +264,16 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     session.conversationHistory.push({ role: 'assistant', content: initResponse.content || '' });
   }
 
+  /** Providers may extend an observation request with immediately available work. */
+  protected readonly rejectAbortedObservation: boolean = false;
+
+  protected observationTurnPrompt(_session: ActiveSession, _message: PendingMessageWithId, prompt: ObservationPromptParts): string {
+    return renderObservationPrompt(prompt);
+  }
+
   private async processObservationMessage(
     session: ActiveSession,
-    message: { prompt_number?: number; tool_name?: string; tool_input?: unknown; tool_response?: unknown; cwd?: string },
+    message: PendingMessageWithId,
     worker: WorkerRef | undefined,
     config: TConfig,
     originalTimestamp: number | null,
@@ -298,7 +310,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
       { sessionDbId: session.sessionDbId, toolName: message.tool_name },
     );
 
-    const obsPrompt = buildObservationPrompt({
+    const obsPrompt = buildObservationPromptParts({
       id: 0,
       tool_name: message.tool_name!,
       tool_input: JSON.stringify(optimized.toolInput),
@@ -308,11 +320,14 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     });
     const responseContext = snapshotResponseContext(session);
 
-    session.conversationHistory.push({ role: 'user', content: obsPrompt });
+    const turnPrompt = this.observationTurnPrompt(session, message, obsPrompt);
+    if (this.rejectAbortedObservation) session.abortController.signal.throwIfAborted();
+    session.conversationHistory.push({ role: 'user', content: turnPrompt });
     session.lastPromptSentAt = Date.now();
     session.lastGeneratorSource = 'ingest';
     const obsResponse = await this.query(session.conversationHistory, config);
 
+    if (this.rejectAbortedObservation) session.abortController.signal.throwIfAborted();
     let tokensUsed = 0;
     if (obsResponse.content) {
       // The assistant turn is appended once, by processAgentResponse below.
