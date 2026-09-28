@@ -11,7 +11,7 @@ import { dirname, join } from 'path';
 import { SettingsDefaultsManager, type SettingsDefaults } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { parseJsonWithBom, writeJsonFileAtomic as writeSettingsJsonAtomic } from '../../shared/atomic-json.js';
-import { loadClaudeMemEnv, saveClaudeMemEnv } from '../../shared/EnvManager.js';
+import { getCredential, loadClaudeMemEnv, saveClaudeMemEnv } from '../../shared/EnvManager.js';
 import { ensureWorkerStarted, type WorkerStartResult } from '../../services/worker-spawner.js';
 import { formatHostForUrl } from '../../shared/worker-utils.js';
 import {
@@ -846,13 +846,14 @@ function mergeSettings(updates: Record<string, string>): boolean {
     if (existsSync(path)) {
       try {
         const parsed = parseJsonWithBom(readFileSync(path, 'utf-8'));
-        if (parsed && typeof parsed === 'object') {
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
           document = parsed as Record<string, unknown>;
           envNested = typeof document.env === 'object' && document.env !== null;
+        } else {
+          throw new Error('settings.json must contain a JSON object');
         }
       } catch (parseError: unknown) {
-        console.warn('[install] Failed to parse existing settings.json, starting from empty:', parseError instanceof Error ? parseError.message : String(parseError));
-        document = {};
+        throw new Error(`Cannot update unreadable settings.json: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
       }
     } else {
       const dir = dirname(path);
@@ -885,12 +886,12 @@ function mergeSettings(updates: Record<string, string>): boolean {
   }
 }
 
-type ProviderId = 'claude' | 'gemini' | 'openrouter' | 'host';
+type ProviderId = 'claude' | 'codex' | 'gemini' | 'openrouter' | 'host';
 /**
  * What the installer prompt may offer. `cmem` is a prompt-only sentinel: picking
  * it configures the generic OpenAI-compatible path (base URL + model + key) and
  * persists CLAUDE_MEM_PROVIDER='openrouter'. The worker only understands
- * 'claude' | 'gemini' | 'openrouter', so 'cmem' must never reach settings.json.
+ * 'claude' | 'codex' | 'gemini' | 'openrouter', so 'cmem' must never reach settings.json.
  */
 type ProviderChoice = ProviderId | 'cmem';
 // Phase 1d: Persisted DB literals (`server_beta_schema_migrations`, job_type
@@ -1067,11 +1068,12 @@ function openBrowser(url: string): void {
   }
 }
 
-async function promptProvider(
+/** Exported for the non-interactive provider setup contract tests. */
+export async function promptProvider(
   options: InstallOptions,
   /**
-   * Null only when login was skipped, which happens solely for an explicit
-   * `--provider claude`. That path cannot reach the CMEM branch below, which
+   * Null only when login was skipped for an explicit local provider.
+   * That path cannot reach the CMEM branch below, which
    * re-checks rather than assuming.
    */
   pairing: InstallerOAuthPairing | null,
@@ -1190,6 +1192,23 @@ async function promptProvider(
     return 'claude';
   }
 
+  if (selectedProvider === 'codex') {
+    const model = options.model?.trim();
+    if (options.model !== undefined && !model) {
+      throw new Error('Codex model must not be empty. Omit --model to keep the current Codex model setting.');
+    }
+    const wrote = mergeSettings({
+      CLAUDE_MEM_PROVIDER: 'codex',
+      ...(model ? { CLAUDE_MEM_CODEX_MODEL: model } : {}),
+    });
+    if (!wrote) {
+      p.cancel('Could not save the Codex provider configuration.');
+      process.exit(1);
+    }
+    log.info('Configured Codex subscription provider. Run `codex login` before starting the worker.');
+    return 'codex';
+  }
+
   if (selectedProvider === 'host') {
     const observerModel = options.ide === 'grok-bot' ? 'grok-bot' : 'cursor';
     const wrote = mergeSettings(buildHostObserverSettings(observerModel, persistedSettings));
@@ -1206,15 +1225,16 @@ async function promptProvider(
     ? 'CLAUDE_MEM_GEMINI_API_KEY'
     : 'CLAUDE_MEM_OPENROUTER_API_KEY';
 
-  const existingKey = getSetting(keyEnvName as keyof SettingsDefaults) as string | undefined;
-  const existingOpenRouterBaseUrl = selectedProvider === 'openrouter'
-    ? String(getSetting('CLAUDE_MEM_OPENROUTER_BASE_URL') ?? '')
-    : '';
-  const existingKeyIsCmem = selectedProvider === 'openrouter'
-    && isCmemGatewayUrl(existingOpenRouterBaseUrl);
-  if (existingKey && existingKey.trim().length > 0 && !existingKeyIsCmem) {
-    const wrote = mergeSettings({ CLAUDE_MEM_PROVIDER: selectedProvider });
-    if (wrote) log.info(`Saved provider=${selectedProvider} to ~/.claude-mem/settings.json`);
+  if (resolvePersonalProviderKey(selectedProvider, persistedSettings)) {
+    const updates = selectedProvider === 'openrouter'
+      ? buildNonInteractiveOpenRouterSettings(
+        persistedSettings,
+        SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_OPENROUTER_MODEL,
+      )
+      : { CLAUDE_MEM_PROVIDER: selectedProvider };
+    const wrote = mergeSettings(updates);
+    if (!wrote) throw new Error(`Could not save the ${providerLabel} provider configuration.`);
+    log.info(`Saved provider=${selectedProvider} to ~/.claude-mem/settings.json`);
     return selectedProvider;
   }
 
@@ -1950,21 +1970,21 @@ async function promptTelemetryOptIn(): Promise<void> {
 /**
  * Whether an install still has an account question to answer.
  *
- * `--provider claude` and `--provider host` are exempt: they either run on the
- * user's own Anthropic plan or the logged-in host agent and need no claude-mem
- * credentials. `gemini` and
+ * `--provider claude`, `--provider codex`, and `--provider host` are exempt:
+ * they use the user's existing local credentials and need no claude-mem
+ * account. `gemini` and
  * `openrouter` are NOT exempt — openrouter is the transport for the cmem
  * gateway, so an explicit `openrouter` install may still be reaching cmem.ai.
  * With no flag at all the provider screen can still offer CMEM Pro, so login
  * must happen first.
  */
 export function providerNeedsAccount(provider: InstallOptions['provider']): boolean {
-  return provider !== 'claude' && provider !== 'host';
+  return provider !== 'claude' && provider !== 'codex' && provider !== 'host';
 }
 
 export interface InstallOptions {
   ide?: string;
-  provider?: 'claude' | 'gemini' | 'openrouter' | 'host';
+  provider?: 'claude' | 'codex' | 'gemini' | 'openrouter' | 'host';
   /**
    * How `provider` was decided. `flag` for an explicit `--provider` (and the
    * grok-bot implicit cmem default set in index.ts), `default` when a fresh
@@ -2025,12 +2045,48 @@ async function requireWorkerStopped(
   }
 }
 
+/** Use the same personal credential source for validation and provider setup. */
+function resolvePersonalProviderKey(provider: 'gemini' | 'openrouter', persisted: Record<string, unknown>): string {
+  const keyName = provider === 'gemini' ? 'CLAUDE_MEM_GEMINI_API_KEY' : 'CLAUDE_MEM_OPENROUTER_API_KEY';
+  const credentialFileKey = String(getCredential(provider === 'gemini' ? 'GEMINI_API_KEY' : 'OPENROUTER_API_KEY') ?? '').trim();
+  if (provider === 'gemini') {
+    return String(getSetting(keyName) ?? '').trim() || credentialFileKey;
+  }
+
+  const baseUrl = String(getSetting('CLAUDE_MEM_OPENROUTER_BASE_URL') ?? '').trim()
+    || process.env.OPENROUTER_BASE_URL?.trim() || '';
+  if (isCmemGatewayUrl(baseUrl)) return '';
+  const detachedCmemGateway = isCmemGatewayUrl(String(persisted.CLAUDE_MEM_OPENROUTER_BASE_URL ?? ''))
+    && Object.prototype.hasOwnProperty.call(process.env, 'CLAUDE_MEM_OPENROUTER_BASE_URL');
+  return detachedCmemGateway
+    ? String(process.env.CLAUDE_MEM_OPENROUTER_API_KEY ?? '').trim() || credentialFileKey
+    : String(getSetting(keyName) ?? '').trim() || credentialFileKey;
+}
+
 /** Exported for the non-interactive contract tests; not part of the CLI surface. */
 export function validateNonInteractiveProvider(
   options: InstallOptions,
   summary: InstallSummary,
 ): void {
   if (isInteractive) return;
+
+  // A corrupt existing file is not a fresh install. Stop before any setup
+  // task can overwrite saved provider, Pro, or cloud-sync configuration.
+  let persisted: Record<string, unknown> = {};
+  if (existsSync(USER_SETTINGS_PATH)) {
+    try {
+      const settings = readFlatSettings(USER_SETTINGS_PATH);
+      if (!settings || Array.isArray(settings)) throw new Error('settings.json must contain a JSON object');
+      persisted = settings;
+    } catch (error: unknown) {
+      installerError(ErrorSeverity.ABORT, {
+        component: 'settings',
+        phase: 'non-interactive-validation',
+        cause: error,
+        remediation: 'Repair ~/.claude-mem/settings.json before running the installer again.',
+      }, summary);
+    }
+  }
 
   if (!options.provider) {
     // No `--provider` on a non-TTY run. Aborting here taught agents to re-run
@@ -2044,34 +2100,41 @@ export function validateNonInteractiveProvider(
     // with a worker that cannot talk to its provider. Unlike the explicit-flag
     // check below, a cmem gateway URL is accepted here: a persisted Pro config
     // keeps its memory key in CLAUDE_MEM_OPENROUTER_API_KEY by design.
-    const persisted = readPersistedInstallerSettings();
     const persistedProvider = persisted.CLAUDE_MEM_PROVIDER;
-    if (persistedProvider === 'claude' || persistedProvider === 'gemini' || persistedProvider === 'openrouter') {
-      if (persistedProvider !== 'claude') {
+    if (persistedProvider === 'claude' || persistedProvider === 'codex' || persistedProvider === 'gemini' || persistedProvider === 'openrouter') {
+      // Codex, like claude, authenticates through a local login rather than a
+      // saved key, so there is nothing to validate before keeping it.
+      if (persistedProvider !== 'claude' && persistedProvider !== 'codex') {
         const persistedKeyName = persistedProvider === 'gemini'
           ? 'CLAUDE_MEM_GEMINI_API_KEY'
           : 'CLAUDE_MEM_OPENROUTER_API_KEY';
         const persistedKey = String(persisted[persistedKeyName] ?? '').trim();
-        // The worker reads a personal key from the environment ahead of
-        // settings.json, so an env-only key is a working configuration; it is
-        // consulted here for validation only and never written to disk. A
-        // persisted cmem gateway tuple is the exception: the worker locks it to
-        // the saved key and ignores a key-only override, so that key must be
-        // on disk. An exported base URL unlocks the tuple (the worker then runs
-        // on the exported URL and key), so the lock is mirrored exactly:
-        // gateway URL on disk AND no base-URL override in the environment.
+        const credentialFileKey = String(getCredential(persistedProvider === 'gemini' ? 'GEMINI_API_KEY' : 'OPENROUTER_API_KEY') ?? '').trim();
+        const hasBaseOverride = Object.prototype.hasOwnProperty.call(process.env, 'CLAUDE_MEM_OPENROUTER_BASE_URL');
+        const persistedBaseUrl = String(persisted.CLAUDE_MEM_OPENROUTER_BASE_URL ?? '').trim();
+        const baseUrl = String(getSetting('CLAUDE_MEM_OPENROUTER_BASE_URL') ?? '').trim()
+          || process.env.OPENROUTER_BASE_URL?.trim() || '';
         const persistedCmemGateway = persistedProvider === 'openrouter'
-          && isCmemGatewayUrl(String(persisted.CLAUDE_MEM_OPENROUTER_BASE_URL ?? ''))
-          && !Object.prototype.hasOwnProperty.call(process.env, 'CLAUDE_MEM_OPENROUTER_BASE_URL');
-        const envKey = persistedCmemGateway ? '' : String(process.env[persistedKeyName] ?? '').trim();
-        if (!persistedKey && !envKey) {
+          && isCmemGatewayUrl(persistedBaseUrl) && !hasBaseOverride;
+        const detachedCmemGateway = persistedProvider === 'openrouter'
+          && isCmemGatewayUrl(persistedBaseUrl) && hasBaseOverride
+          && !isCmemGatewayUrl(baseUrl);
+        // Match the worker's source-coherent key tuple. A saved gateway key
+        // stays locked to that gateway, and cannot follow a base URL override
+        // to a personal endpoint. ~/.claude-mem/.env can supply personal keys.
+        const usableKey = persistedCmemGateway
+          ? persistedKey
+          : detachedCmemGateway
+            ? String(process.env.CLAUDE_MEM_OPENROUTER_API_KEY ?? '').trim() || credentialFileKey
+            : String(getSetting(persistedKeyName as keyof SettingsDefaults) ?? '').trim() || credentialFileKey;
+        if (!usableKey) {
           installerError(ErrorSeverity.ABORT, {
             component: 'provider-credentials',
             phase: 'non-interactive-validation',
-            cause: new Error(`The configured ${persistedProvider} provider has no API key saved${persistedCmemGateway ? '' : ' or exported'}, so a non-interactive run cannot keep it.`),
+            cause: new Error(`The configured ${persistedProvider} provider has no usable API key, so a non-interactive run cannot keep it.`),
             remediation: persistedCmemGateway
               ? `Save ${persistedKeyName} in ~/.claude-mem/settings.json (the cmem gateway ignores an exported key), pass --provider claude to switch to your Anthropic plan, or run the installer in an interactive terminal.`
-              : `Save ${persistedKeyName} in ~/.claude-mem/settings.json or export it in the environment, pass --provider claude to switch to your Anthropic plan, or run the installer in an interactive terminal.`,
+              : `Save a personal ${persistedKeyName} in settings or the applicable ~/.claude-mem/.env credential, pass --provider claude to switch to your Anthropic plan, or run the installer in an interactive terminal.`,
           }, summary);
         }
       }
@@ -2090,15 +2153,12 @@ export function validateNonInteractiveProvider(
   const keyName = options.provider === 'gemini'
     ? 'CLAUDE_MEM_GEMINI_API_KEY'
     : 'CLAUDE_MEM_OPENROUTER_API_KEY';
-  const key = String(getSetting(keyName as keyof SettingsDefaults) ?? '').trim();
-  const configuredCmemKey = options.provider === 'openrouter'
-    && isCmemGatewayUrl(String(getSetting('CLAUDE_MEM_OPENROUTER_BASE_URL') ?? ''));
-  if (!key || configuredCmemKey) {
+  if (!resolvePersonalProviderKey(options.provider, persisted)) {
     installerError(ErrorSeverity.ABORT, {
       component: 'provider-credentials',
       phase: 'non-interactive-validation',
       cause: new Error(`${options.provider} requires a preconfigured personal API key when stdin is not interactive.`),
-      remediation: `Save ${keyName} first, or run the installer in an interactive terminal so it can ask securely.`,
+      remediation: `Save a personal ${keyName} or the matching ~/.claude-mem/.env credential first, or run the installer in an interactive terminal so it can ask securely.`,
     }, summary);
   }
 }
@@ -2391,9 +2451,11 @@ async function runInstallCommandInner(options: InstallOptions, summary: InstallS
   } else {
     const skipReason = options.provider === 'host'
       ? 'host observer uses the logged-in host agent over a local OpenAI-compatible shim.'
-      : options.providerSource === 'default'
-        ? 'no --provider was given, so memory defaults to your own Anthropic plan.'
-        : '--provider claude runs memory on your own Anthropic plan.';
+      : options.provider === 'codex'
+        ? '--provider codex uses the local Codex subscription login.'
+        : options.providerSource === 'default'
+          ? 'no --provider was given, so memory defaults to your own Anthropic plan.'
+          : '--provider claude runs memory on your own Anthropic plan.';
     log.info(`Skipping claude-mem login: ${skipReason}`);
   }
   const selectedProvider = await promptProvider(options, oauthPairing, version);
