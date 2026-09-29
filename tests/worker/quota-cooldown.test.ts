@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, afterAll } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
 import { join } from 'path';
+import { mkdirSync, writeFileSync } from 'fs';
 import {
   isQuotaCooldownActive,
   tryAdmitQuotaProbe,
@@ -10,6 +11,10 @@ import {
   resetQuotaCooldownsForTesting,
   QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS,
   QUOTA_PROBE_STALE_MS,
+  QUOTA_COOLDOWN_FILENAME,
+  isQuotaCooldownHolding,
+  setQuotaFallbackResolver,
+  type QuotaFallbackResolver,
 } from '../../src/shared/quota-cooldown.js';
 import {
   isObserverQuotaCooldownActive,
@@ -276,5 +281,114 @@ describe('quota cooldown breaker (#3634)', () => {
     const cleared = readObserverHealth(healthPath);
     expect(cleared === null || cleared.quotaCooldown === null).toBe(true);
     expect(isObserverQuotaCooldownActive(cleared)).toBe(false);
+  });
+});
+
+describe('isQuotaCooldownHolding (quota fallback)', () => {
+  beforeEach(() => {
+    resetQuotaCooldownsForTesting();
+  });
+
+  // The breaker is process-global and these tests arm it, on disk as well.
+  afterEach(() => {
+    resetQuotaCooldownsForTesting();
+  });
+
+  it('is false when no breaker is armed', () => {
+    expect(isQuotaCooldownHolding('gemini')).toBe(false);
+  });
+
+  it('holds for the whole cooldown window', () => {
+    const armedAt = Date.now();
+    recordQuotaExhausted('gemini', 'Daily limit reached', undefined, armedAt);
+    expect(isQuotaCooldownHolding('gemini', armedAt + QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS - 1)).toBe(true);
+  });
+
+  it('stops holding once the window elapses with no probe in flight, so the primary can claim its probe', () => {
+    recordQuotaExhausted('gemini', 'Daily limit reached', undefined, Date.now() - QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS - 1);
+    expect(isQuotaCooldownHolding('gemini')).toBe(false);
+  });
+
+  it('holds while the single post-expiry probe is in flight and fresh', () => {
+    recordQuotaExhausted('gemini', 'Daily limit reached', undefined, Date.now() - QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS - 1);
+    const claimedAt = Date.now();
+    expect(tryAdmitQuotaProbe('gemini', claimedAt).admitted).toBe(true);
+    expect(isQuotaCooldownHolding('gemini', claimedAt + QUOTA_PROBE_STALE_MS - 1)).toBe(true);
+  });
+
+  it('stops holding once that probe goes stale', () => {
+    recordQuotaExhausted('gemini', 'Daily limit reached', undefined, Date.now() - QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS - 1);
+    const claimedAt = Date.now();
+    expect(tryAdmitQuotaProbe('gemini', claimedAt).admitted).toBe(true);
+    expect(isQuotaCooldownHolding('gemini', claimedAt + QUOTA_PROBE_STALE_MS)).toBe(false);
+  });
+
+  it('never claims the probe', () => {
+    recordQuotaExhausted('gemini', 'Daily limit reached', undefined, Date.now() - QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS - 1);
+    isQuotaCooldownHolding('gemini');
+    isQuotaCooldownHolding('gemini');
+    expect(getQuotaCooldown('gemini')!.probeInFlightSinceMs).toBeNull();
+    expect(tryAdmitQuotaProbe('gemini').admitted).toBe(true);
+  });
+
+  it('is scoped per provider', () => {
+    recordQuotaExhausted('gemini', 'Daily limit reached');
+    expect(isQuotaCooldownHolding('gemini')).toBe(true);
+    expect(isQuotaCooldownHolding('claude')).toBe(false);
+  });
+
+  it('sees a breaker armed by a previous worker process', () => {
+    // A restart must not send work back to a provider whose window is still open.
+    mkdirSync(paths.dataDir(), { recursive: true });
+    writeFileSync(
+      join(paths.dataDir(), QUOTA_COOLDOWN_FILENAME),
+      JSON.stringify([{ provider: 'gemini', message: 'armed before the restart', armedAtMs: Date.now() - 60_000 }]),
+    );
+    expect(isQuotaCooldownHolding('gemini')).toBe(true);
+  });
+});
+
+describe('quota fallback annotation on the mirrored cooldown', () => {
+  const healthPath = (): string => join(paths.dataDir(), OBSERVER_HEALTH_FILENAME);
+  let restore: QuotaFallbackResolver | null = null;
+
+  beforeEach(() => {
+    resetQuotaCooldownsForTesting();
+  });
+
+  afterEach(() => {
+    setQuotaFallbackResolver(restore);
+    resetQuotaCooldownsForTesting();
+  });
+
+  it('records where capture continues while the breaker holds', () => {
+    restore = setQuotaFallbackResolver((provider) => (provider === 'gemini' ? 'claude' : null));
+    recordQuotaExhausted('gemini', 'Daily limit reached');
+    expect(readObserverHealth(healthPath())!.quotaCooldown!.servingProvider).toBe('claude');
+  });
+
+  it('records no serving provider when none can serve, so the notice still says paused', () => {
+    restore = setQuotaFallbackResolver(() => null);
+    recordQuotaExhausted('gemini', 'Daily limit reached');
+    expect(readObserverHealth(healthPath())!.quotaCooldown!.servingProvider).toBeUndefined();
+  });
+
+  it('re-mirrors when the fallback arms its own breaker: the resolver is asked about the latest window', () => {
+    restore = setQuotaFallbackResolver((provider) => (provider === 'gemini' ? 'claude' : null));
+    recordQuotaExhausted('gemini', 'Daily limit reached', undefined, Date.now() - 1000);
+    recordQuotaExhausted('claude', 'Weekly limit reached');
+    const mirrored = readObserverHealth(healthPath())!.quotaCooldown!;
+    expect(mirrored.provider).toBe('claude');
+    expect(mirrored.servingProvider).toBeUndefined();
+  });
+
+  it('still mirrors the cooldown when the resolver throws', () => {
+    restore = setQuotaFallbackResolver(() => {
+      throw new Error('settings unreadable');
+    });
+    recordQuotaExhausted('gemini', 'Daily limit reached');
+    const mirrored = readObserverHealth(healthPath())!.quotaCooldown!;
+    expect(mirrored.provider).toBe('gemini');
+    expect(mirrored.servingProvider).toBeUndefined();
   });
 });
